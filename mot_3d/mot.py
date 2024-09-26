@@ -9,8 +9,8 @@ from .association import associate_dets_to_tracks
 from . import visualization
 from mot_3d import redundancy
 import pdb, os
-
-
+import time
+import logging
 class MOTModel:
     def __init__(self, configs):
         self.trackers = list()         # tracker for each single tracklet
@@ -57,10 +57,14 @@ class MOTModel:
         if not input_data.aux_info['is_key_frame']:
             result = self.non_key_frame_mot(input_data)
             return result
-    
+        start_time = time.perf_counter()
         if 'kf' in self.motion_model:
             matched, unmatched_dets, unmatched_trks = self.forward_step_trk(input_data)
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.debug(f"forward_step_trk took {duration:.6f} seconds")
         
+        start_time = time.perf_counter()
         time_lag = input_data.time_stamp - self.time_stamp
         # update the matched tracks
         for t, trk in enumerate(self.trackers):
@@ -117,7 +121,9 @@ class MOTModel:
         self.time_stamp = input_data.time_stamp
         for trk in self.trackers:
             trk.sync_time_stamp(self.time_stamp)
-
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.debug(f"After forward_step_trk took {duration:.6f} seconds")
         return result
     
     def forward_step_trk(self, input_data: FrameData):
@@ -127,17 +133,22 @@ class MOTModel:
 
         # prediction and association
         trk_preds = list()
+        start_time = time.perf_counter()
         for trk in self.trackers:
             trk_preds.append(trk.predict(input_data.time_stamp, input_data.aux_info['is_key_frame']))
-        
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.debug(f"Prediction took {duration:.6f} seconds")
         # for m-distance association
         trk_innovation_matrix = None
         if self.asso == 'm_dis':
             trk_innovation_matrix = [trk.compute_innovation_matrix() for trk in self.trackers] 
-
+        start_time = time.perf_counter()
         matched, unmatched_dets, unmatched_trks = associate_dets_to_tracks(dets, trk_preds, 
             self.match_type, self.asso, self.asso_thres, trk_innovation_matrix)
-        
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.debug(f"Association took {duration:.6f} seconds")
         for k in range(len(matched)):
             matched[k][0] = det_indexes[matched[k][0]]
         for k in range(len(unmatched_dets)):
@@ -153,9 +164,12 @@ class MOTModel:
 
         # prediction and association
         trk_preds = list()
+        start_time = time.perf_counter()
         for trk in self.trackers:
             trk_preds.append(trk.predict(input_data.time_stamp, input_data.aux_info['is_key_frame']))
-        
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.debug(f"Non Keyframe prediction took {duration:.6f} seconds")
         # for m-distance association
         trk_innovation_matrix = None
         if self.asso == 'm_dis':
@@ -177,9 +191,14 @@ class MOTModel:
         # initialize the time stamp on frame 0
         if self.time_stamp is None:
             self.time_stamp = input_data.time_stamp
-        
+        start_time = time.perf_counter()
         if 'kf' in self.motion_model:
             matched, unmatched_dets, unmatched_trks = self.non_key_forward_step_trk(input_data)
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.debug(f"non_key_forward_step_trk took {duration:.6f} seconds")
+        
+        start_time = time.perf_counter()
         time_lag = input_data.time_stamp - self.time_stamp
 
         redundancy_bboxes, update_modes = self.non_key_redundancy.bipartite_infer(input_data, self.trackers)
@@ -217,5 +236,7 @@ class MOTModel:
         self.time_stamp = input_data.time_stamp
         for trk in self.trackers:
             trk.sync_time_stamp(self.time_stamp)
-
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        logging.debug(f"after non_key_forward_step_trk took {duration:.6f} seconds")
         return result

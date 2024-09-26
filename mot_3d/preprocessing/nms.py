@@ -3,6 +3,7 @@ from .. import utils
 from ..data_protos import BBox
 from .bbox_coarse_hash import BBoxCoarseFilter
 
+import logging
 
 def weird_bbox(bbox):
     if bbox.l <= 0 or bbox.w <= 0 or bbox.h <= 0:
@@ -14,7 +15,7 @@ def weird_bbox(bbox):
 def nms(dets, inst_types, threshold_low=0.1, threshold_high=1.0, threshold_yaw=0.3):
     """ keep the bboxes with overlap <= threshold
     """
-    dets_coarse_filter = BBoxCoarseFilter(grid_size=100, scaler=100)
+    dets_coarse_filter = BBoxCoarseFilter(grid_size=2, scaler=1)
     dets_coarse_filter.bboxes2dict(dets)
     scores = np.asarray([det.s for det in dets])
     yaws = np.asarray([det.o for det in dets])
@@ -37,6 +38,7 @@ def nms(dets, inst_types, threshold_low=0.1, threshold_high=1.0, threshold_yaw=0
 
         # compute the ious
         bbox_num = len(related_idxes)
+        # logging.info(f"No. of related boxes: {bbox_num}")
         ious = np.zeros(bbox_num)
         for i, idx in enumerate(related_idxes):
             ious[i] = utils.iou3d(dets[index], dets[idx])[1]

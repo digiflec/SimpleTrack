@@ -66,6 +66,7 @@ class BBox:
         bboxa.s = bboxb.s
         return
     
+    # TODO: box2corners2d/3d should be properties to avoid repeated corners calculation.
     @classmethod
     def box2corners2d(cls, bbox):
         """ the coordinates for bottom corners

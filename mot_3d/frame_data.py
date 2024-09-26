@@ -13,8 +13,8 @@ class FrameData:
         self.time_stamp = time_stamp
         self.aux_info = aux_info
 
-        for i, det in enumerate(self.dets):
-            self.dets[i] = BBox.array2bbox(det)
+        # for i, det in enumerate(self.dets):
+        #     self.dets[i] = BBox.array2bbox(det)
         
         # if not aux_info['is_key_frame']:
         #     self.dets = [d for d in self.dets if d.s >= 0.5]

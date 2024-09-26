@@ -4,7 +4,7 @@ from scipy.optimize import linear_sum_assignment
 from .frame_data import FrameData
 from .update_info_data import UpdateInfoData
 from .data_protos import BBox, Validity
-
+from .preprocessing.bbox_coarse_hash import BBoxCoarseFilter
 
 def associate_dets_to_tracks(dets, tracks, mode, asso, 
     dist_threshold=0.9, trk_innovation_matrix=None):
@@ -38,9 +38,9 @@ def associate_dets_to_tracks(dets, tracks, mode, asso,
 
 def bipartite_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix):
     if asso == 'iou':
-        dist_matrix = compute_iou_distance(dets, tracks, asso)
+        dist_matrix = compute_iou_distance_custom(dets, tracks, asso)
     elif asso == 'giou':
-        dist_matrix = compute_iou_distance(dets, tracks, asso)
+        dist_matrix = compute_iou_distance_custom(dets, tracks, asso)
     elif asso == 'm_dis':
         dist_matrix = compute_m_distance(dets, tracks, trk_innovation_matrix)
     elif asso == 'euler':
@@ -116,5 +116,32 @@ def compute_iou_distance(dets, tracks, asso='iou'):
                 iou_matrix[d, t] = utils.iou3d(det, trk)[1]
             elif asso == 'giou':
                 iou_matrix[d, t] = utils.giou3d(det, trk)
+    dist_matrix = 1 - iou_matrix
+    return dist_matrix
+
+
+
+def compute_iou_distance_custom(dets, tracks, asso='iou'):
+    # Create a coarse filter for both detections and tracks
+    dets_coarse_filter = BBoxCoarseFilter(grid_size=2, scaler=1)
+    tracks_coarse_filter = BBoxCoarseFilter(grid_size=2, scaler=1)
+    
+    dets_coarse_filter.bboxes2dict(dets)
+    tracks_coarse_filter.bboxes2dict(tracks)
+    
+    iou_matrix = np.zeros((len(dets), len(tracks)))
+    
+    for d, det in enumerate(dets):
+        related_tracks_idxes = tracks_coarse_filter.related_bboxes(det)
+        if len(related_tracks_idxes) == 0:
+            continue  # Skip if no related tracks in the nearby grid
+        
+        for t in related_tracks_idxes:
+            trk = tracks[t]
+            if asso == 'iou':
+                iou_matrix[d, t] = utils.iou3d(det, trk)[1]
+            elif asso == 'giou':
+                iou_matrix[d, t] = utils.giou3d(det, trk)
+    
     dist_matrix = 1 - iou_matrix
     return dist_matrix
