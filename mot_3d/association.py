@@ -6,16 +6,31 @@ from .update_info_data import UpdateInfoData
 from .data_protos import BBox, Validity
 from .preprocessing.bbox_coarse_hash import BBoxCoarseFilter
 
-def associate_dets_to_tracks(dets, tracks, mode, asso, 
-    dist_threshold=0.9, trk_innovation_matrix=None):
+# Cost written over a pair the per-track gate excludes, so linear_sum_assignment
+# can still return a square-matrix solution but never *prefers* an excluded pair.
+OUT_OF_GATE_COST = 1e6
+
+
+def associate_dets_to_tracks(dets, tracks, mode, asso,
+    dist_threshold=0.9, trk_innovation_matrix=None, trk_gates=None):
     """ associate the tracks with detections
+
+        trk_gates (optional): per-track positional gate in metres. When given (only
+        supported with mode 'bipartite'), a det/track pair whose xy centre distance
+        exceeds the track's gate is excluded BEFORE the assignment runs, and the
+        flat dist_threshold post-check is skipped. Applying the threshold only
+        after the assignment lets a detection with no legitimate owner displace a
+        real pairing -- the pair is then discarded, both ends go free, and the
+        cascade lands on a wrong-but-in-gate match (CIIMDEV-779).
     """
     if mode == 'bipartite':
-        matched_indices, dist_matrix = \
-            bipartite_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix)
+        matched_indices, dist_matrix, over_gate = \
+            bipartite_matcher(dets, tracks, asso, dist_threshold,
+                              trk_innovation_matrix, trk_gates)
     elif mode == 'greedy':
         matched_indices, dist_matrix = \
             greedy_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix)
+        over_gate = None
     unmatched_dets = list()
     for d, det in enumerate(dets):
         if d not in matched_indices[:, 0]:
@@ -25,10 +40,14 @@ def associate_dets_to_tracks(dets, tracks, mode, asso,
     for t, trk in enumerate(tracks):
         if t not in matched_indices[:, 1]:
             unmatched_tracks.append(t)
-    
+
     matches = list()
     for m in matched_indices:
-        if dist_matrix[m[0], m[1]] > dist_threshold:
+        if over_gate is not None:
+            rejected = over_gate[m[0], m[1]]
+        else:
+            rejected = dist_matrix[m[0], m[1]] > dist_threshold
+        if rejected:
             unmatched_dets.append(m[0])
             unmatched_tracks.append(m[1])
         else:
@@ -36,7 +55,8 @@ def associate_dets_to_tracks(dets, tracks, mode, asso,
     return matches, np.array(unmatched_dets), np.array(unmatched_tracks)
 
 
-def bipartite_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix):
+def bipartite_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix,
+                      trk_gates=None):
     if asso == 'iou':
         dist_matrix = compute_iou_distance_custom(dets, tracks, asso)
     elif asso == 'giou':
@@ -45,9 +65,23 @@ def bipartite_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix)
         dist_matrix = compute_m_distance(dets, tracks, trk_innovation_matrix)
     elif asso == 'euler':
         dist_matrix = compute_m_distance(dets, tracks, None)
-    row_ind, col_ind = linear_sum_assignment(dist_matrix)
+
+    over_gate = None
+    cost_matrix = dist_matrix
+    if trk_gates is not None:
+        # Gate on the xy residual, not on dist_matrix: the euler cost is a 7-D
+        # norm that is ~2/3 box-size jitter, so a kinematic budget applied to it
+        # fragments the tracker. The full cost still RANKS the in-gate candidates.
+        xy = np.empty(dist_matrix.shape)
+        for d, det in enumerate(dets):
+            for t, trk in enumerate(tracks):
+                xy[d, t] = np.hypot(det.x - trk.x, det.y - trk.y)
+        over_gate = xy > np.asarray(trk_gates)[np.newaxis, :]
+        cost_matrix = np.where(over_gate, OUT_OF_GATE_COST, dist_matrix)
+
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
     matched_indices = np.stack([row_ind, col_ind], axis=1)
-    return matched_indices, dist_matrix
+    return matched_indices, dist_matrix, over_gate
 
 
 def greedy_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix):
