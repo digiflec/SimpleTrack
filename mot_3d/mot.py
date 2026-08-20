@@ -37,6 +37,38 @@ class MOTModel:
         self.max_age = configs['running']['max_age_since_update']
         self.min_hits = configs['running']['min_hits_to_birth']
 
+        # CIIMDEV-779: optional per-track kinematic association gate, dict with
+        # keys floor / speed_factor / accel (see kinematic_gates below). None
+        # keeps the legacy behaviour: flat asso_thres applied after assignment.
+        self.kinematic_gate = configs['running'].get('kinematic_gate', None)
+
+    def kinematic_gates(self, time_stamp):
+        """ Per-track positional association gate in metres.
+
+            The prediction sits at +v*dt; a target that reverses at constant speed
+            lands at -v*dt, so the residual is bounded by speed_factor(=2)*v*dt.
+            The accel term is the unmodelled acceleration: an unknown a over dt
+            displaces the target by a*dt^2/2 whatever its current speed, which is
+            what re-opens the gate for a track that was STATIONARY when it was
+            lost (v~0 keeps the velocity term at zero however long the coast).
+            dt only advances while unobserved, so the gate widens exactly as far
+            as a coast has degraded the estimate, up to the flat asso_thres cap.
+        """
+        cfg = self.kinematic_gate
+        gates = list()
+        for trk in self.trackers:
+            gate = self.asso_thres
+            try:
+                kf = trk.motion_model.kf
+                speed = np.hypot(float(kf.x[7, 0]), float(kf.x[8, 0]))
+                dt = max(time_stamp - trk.motion_model.prev_time_stamp, 0.0)
+                gate = min(gate, cfg['floor'] + cfg['speed_factor'] * speed * dt
+                           + 0.5 * cfg['accel'] * dt * dt)
+            except AttributeError:
+                pass    # non-KF motion model: fall back to the flat cap
+            gates.append(gate)
+        return gates
+
     @property
     def has_velo(self):
         return not (self.motion_model == 'kf' or self.motion_model == 'fbkf' or self.motion_model == 'ma')
@@ -143,9 +175,13 @@ class MOTModel:
         trk_innovation_matrix = None
         if self.asso == 'm_dis':
             trk_innovation_matrix = [trk.compute_innovation_matrix() for trk in self.trackers] 
+        trk_gates = None
+        if self.kinematic_gate is not None and self.match_type == 'bipartite':
+            trk_gates = self.kinematic_gates(input_data.time_stamp)
         start_time = time.perf_counter()
-        matched, unmatched_dets, unmatched_trks = associate_dets_to_tracks(dets, trk_preds, 
-            self.match_type, self.asso, self.asso_thres, trk_innovation_matrix)
+        matched, unmatched_dets, unmatched_trks = associate_dets_to_tracks(dets, trk_preds,
+            self.match_type, self.asso, self.asso_thres, trk_innovation_matrix,
+            trk_gates=trk_gates)
         end_time = time.perf_counter()
         duration = end_time - start_time
         logging.debug(f"Association took {duration:.6f} seconds")
