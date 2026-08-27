@@ -21,7 +21,8 @@ class Tracklet:
         # simple kalman filter
         if self.motion_model_type == 'kf':
             self.motion_model = motion_model.KalmanFilterMotionModel(
-                bbox=bbox, inst_type=self.det_type, time_stamp=time_stamp, covariance=configs['running']['covariance'])
+                bbox=bbox, inst_type=self.det_type, time_stamp=time_stamp, covariance=configs['running']['covariance'],
+                max_speed=configs['running'].get('max_speed', 0.0))
 
         # life and death management
         self.life_manager = life_manager.HitManager(configs, frame_index)

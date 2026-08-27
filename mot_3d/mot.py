@@ -41,6 +41,20 @@ class MOTModel:
         # keys floor / speed_factor / accel (see kinematic_gates below). None
         # keeps the legacy behaviour: flat asso_thres applied after assignment.
         self.kinematic_gate = configs['running'].get('kinematic_gate', None)
+        # CIIMDEV-779 ghost suppression (see suppress_ghosts); 0 disables.
+        self.ghost_dist = float(configs['running'].get('ghost_suppress_dist', 0.0) or 0.0)
+        self.ghost_frames = int(configs['running'].get('ghost_suppress_frames', 3))
+        # CIIMDEV-779: person prior on the detection footprint (0 = off). A box
+        # wider than this in either horizontal dimension is not one person (the
+        # dbt branch re-segments a group or a desk around a live track into a
+        # 2 m "ADULT" the classifier would never accept) and can neither
+        # continue nor birth a track.
+        self.max_det_footprint = float(configs['running'].get('max_det_footprint', 0.0) or 0.0)
+
+    def person_sized(self, det):
+        if self.max_det_footprint <= 0:
+            return True
+        return max(float(det.l), float(det.w)) <= self.max_det_footprint
 
     def kinematic_gates(self, time_stamp):
         """ Per-track positional association gate in metres.
@@ -62,12 +76,122 @@ class MOTModel:
                 kf = trk.motion_model.kf
                 speed = np.hypot(float(kf.x[7, 0]), float(kf.x[8, 0]))
                 dt = max(time_stamp - trk.motion_model.prev_time_stamp, 0.0)
-                gate = min(gate, cfg['floor'] + cfg['speed_factor'] * speed * dt
-                           + 0.5 * cfg['accel'] * dt * dt)
+                if cfg.get('max_speed', 0.0) > 0:
+                    # Physical gate (CIIMDEV-779 round 3): the target is within
+                    # floor + v_max * (time since last observed) of where it was
+                    # LAST OBSERVED, whatever the filter believes its velocity
+                    # is. Centred there too (see gate_centres), so a poisoned
+                    # velocity can neither move the gate nor widen it, and no
+                    # association can ever imply a super-human displacement.
+                    gate = min(gate, cfg['floor'] + cfg['max_speed'] * dt)
+                else:
+                    gate = min(gate, cfg['floor'] + cfg['speed_factor'] * speed * dt
+                               + 0.5 * cfg['accel'] * dt * dt)
             except AttributeError:
                 pass    # non-KF motion model: fall back to the flat cap
             gates.append(gate)
         return gates
+
+    def gate_centres(self, trk_preds):
+        """ Where each track's gate is centred: the last OBSERVED position under
+            the physical gate (the KF state only moves on an update, so x[0:2] is
+            exactly that), the prediction otherwise.
+        """
+        cfg = self.kinematic_gate
+        centres = list()
+        for trk, pred in zip(self.trackers, trk_preds):
+            if cfg is not None and cfg.get('max_speed', 0.0) > 0:
+                try:
+                    kf = trk.motion_model.kf
+                    centres.append((float(kf.x[0, 0]), float(kf.x[1, 0])))
+                    continue
+                except AttributeError:
+                    pass
+            centres.append((pred.x, pred.y))
+        return centres
+
+    def second_stage(self, input_data, matched, unmatched_dets, unmatched_trks):
+        """ CIIMDEV-779: continue unmatched tracks on the detections stage 1 left.
+
+            redundancy mode 'kinematic'. Candidates are every detection stage 1 did
+            not consume and that scores above the redundancy score floor: the
+            sub-threshold ones it never saw (a person whose classifier score
+            flickered under score_threshold for a frame -- 44% of DCLG-4's coasted
+            rows had one within 0.5 m) and the above-threshold ones it left
+            unmatched (which would otherwise birth a duplicate track next to the
+            coasting one). Same per-track kinematic gate as stage 1, applied on
+            the xy residual, one bipartite assignment on that residual.
+
+            Unlike the stock 'mm' redundancy, a match here hands the REAL
+            detection to the track (the KF corrects to it, the published score is
+            the detection's), so the row goes out as an observation. Stage 1 keeps
+            priority: only its leftovers on both sides take part.
+
+            Returns ({track index: det index}, unmatched_dets minus the consumed).
+        """
+        dets = input_data.dets
+        min_s = self.redundancy.det_score
+        leftover = set(int(i) for i in unmatched_dets)
+        cand = [i for i, det in enumerate(dets)
+                if det.s > min_s and (det.s < self.score_threshold or i in leftover)
+                and self.person_sized(det)]
+        trks = [int(t) for t in unmatched_trks]
+        if len(cand) == 0 or len(trks) == 0:
+            return {}, unmatched_dets
+        gates = self._trk_gates
+        if gates is None:
+            gates = [self.asso_thres] * len(self.trackers)
+        # A continuation is conservative: the detection has to be near where the
+        # track IS, so the stage-1 gate (which widens with the coasted speed --
+        # exactly the poisoned speed a runaway carries) is capped by a flat
+        # radius, redundancy det_dist_threshold when it is positive.
+        cap = self.redundancy.det_threshold if self.redundancy.det_threshold > 0 else np.inf
+        # Neighbour ownership: a detection that sits closer to a track stage 1
+        # already matched (with its own detection) is a fragment of that
+        # neighbour, not this track's continuation.
+        owned = [self._trk_preds[int(m[1])] for m in matched]
+        centres = self._trk_centres
+        if centres is None:
+            centres = [(p.x, p.y) for p in self._trk_preds]
+        cost = np.empty((len(cand), len(trks)))
+        for a, i in enumerate(cand):
+            d_owned = min([np.hypot(dets[i].x - p.x, dets[i].y - p.y) for p in owned] or [np.inf])
+            for b, t in enumerate(trks):
+                cx, cy = centres[t]
+                xy = np.hypot(dets[i].x - cx, dets[i].y - cy)
+                ok = xy <= min(gates[t], cap) and xy <= d_owned
+                cost[a, b] = xy if ok else 1e6
+        row_ind, col_ind = linear_sum_assignment(cost)
+        second = {}
+        for a, b in zip(row_ind, col_ind):
+            if cost[a, b] < 1e6:
+                second[trks[b]] = cand[a]
+        consumed = set(second.values())
+        unmatched_dets = np.array([i for i in unmatched_dets if int(i) not in consumed])
+        return second, unmatched_dets
+
+    def suppress_ghosts(self):
+        """ CIIMDEV-779: retire a coasting track that is sitting on an observed one.
+
+            After the frame's updates, a track that was NOT associated this frame
+            (life recent_state 0) and whose state lies within ghost_dist of a track
+            that WAS observed this frame is a duplicate of that track -- the
+            person is being tracked by the neighbour; this one is a ghost that
+            would otherwise drift on its frozen velocity until max_age. After
+            ghost_frames consecutive such frames it is marked dead. The counter
+            resets whenever the track is observed or the neighbour moves off.
+        """
+        observed = [trk for trk in self.trackers if trk.life_manager.recent_state != 0]
+        for trk in self.trackers:
+            if trk.life_manager.recent_state != 0:
+                trk.ghost_count = 0
+                continue
+            st = trk.get_state()
+            on_top = any(np.hypot(st.x - o.get_state().x, st.y - o.get_state().y) <= self.ghost_dist
+                         for o in observed)
+            trk.ghost_count = getattr(trk, 'ghost_count', 0) + 1 if on_top else 0
+            if trk.ghost_count >= self.ghost_frames:
+                trk.life_manager.state = 'dead'
 
     @property
     def has_velo(self):
@@ -98,6 +222,11 @@ class MOTModel:
         
         start_time = time.perf_counter()
         time_lag = input_data.time_stamp - self.time_stamp
+        # CIIMDEV-779: second-stage continuation of the tracks stage 1 left
+        # unmatched, on the detections it did not consume (see second_stage).
+        second = {}
+        if self.redundancy.mode == 'kinematic' and self.match_type == 'bipartite':
+            second, unmatched_dets = self.second_stage(input_data, matched, unmatched_dets, unmatched_trks)
         # update the matched tracks
         for t, trk in enumerate(self.trackers):
             if t not in unmatched_trks:
@@ -107,13 +236,22 @@ class MOTModel:
                         break
                 if self.has_velo:
                     aux_info = {
-                        'velo': list(input_data.aux_info['velos'][d]), 
+                        'velo': list(input_data.aux_info['velos'][d]),
                         'is_key_frame': input_data.aux_info['is_key_frame']}
                 else:
                     aux_info = {'is_key_frame': input_data.aux_info['is_key_frame']}
-                update_info = UpdateInfoData(mode=1, bbox=input_data.dets[d], ego=input_data.ego, 
-                    frame_index=self.frame_count, pc=input_data.pc, 
+                update_info = UpdateInfoData(mode=1, bbox=input_data.dets[d], ego=input_data.ego,
+                    frame_index=self.frame_count, pc=input_data.pc,
                     dets=input_data.dets, aux_info=aux_info)
+                trk.update(update_info)
+            elif t in second:
+                # Continue the track on the real detection: the KF is corrected
+                # to it and the published score is the detection's own, so a
+                # consumer sees an observation, not a prediction.
+                aux_info = {'is_key_frame': input_data.aux_info['is_key_frame']}
+                update_info = UpdateInfoData(mode=3, bbox=input_data.dets[second[t]],
+                    ego=input_data.ego, frame_index=self.frame_count,
+                    pc=input_data.pc, dets=input_data.dets, aux_info=aux_info)
                 trk.update(update_info)
             else:
                 result_bbox, update_mode, aux_info = self.redundancy.infer(trk, input_data, time_lag)
@@ -137,18 +275,29 @@ class MOTModel:
             self.trackers.append(track)
             self.count += 1
         
+        if self.ghost_dist > 0:
+            self.suppress_ghosts()
+
         # remove dead tracks
         track_num = len(self.trackers)
         for index, trk in enumerate(reversed(self.trackers)):
             if trk.death(self.frame_count):
                 self.trackers.pop(track_num - 1 - index)
-        
+
         # output the results
         result = list()
         for trk in self.trackers:
             state_string = trk.state_string(self.frame_count)
-            result.append((trk.get_state(), trk.id, state_string, trk.det_type))
-        
+            state = trk.get_state()
+            # CIIMDEV-779: expose the filter's own velocity on the output bbox so
+            # a consumer can report it instead of finite-differencing poses
+            try:
+                kf = trk.motion_model.kf
+                state.vx, state.vy = float(kf.x[7, 0]), float(kf.x[8, 0])
+            except AttributeError:
+                pass
+            result.append((state, trk.id, state_string, trk.det_type))
+
         # wrap up and update the information about the mot trackers
         self.time_stamp = input_data.time_stamp
         for trk in self.trackers:
@@ -160,7 +309,8 @@ class MOTModel:
     
     def forward_step_trk(self, input_data: FrameData):
         dets = input_data.dets
-        det_indexes = [i for i, det in enumerate(dets) if det.s >= self.score_threshold]
+        det_indexes = [i for i, det in enumerate(dets)
+                       if det.s >= self.score_threshold and self.person_sized(det)]
         dets = [dets[i] for i in det_indexes]
 
         # prediction and association
@@ -178,10 +328,15 @@ class MOTModel:
         trk_gates = None
         if self.kinematic_gate is not None and self.match_type == 'bipartite':
             trk_gates = self.kinematic_gates(input_data.time_stamp)
+        # kept for second_stage: predict() has side effects, so it must not
+        # be called a second time for the same frame
+        self._trk_preds = trk_preds
+        self._trk_gates = trk_gates
+        self._trk_centres = self.gate_centres(trk_preds) if trk_gates is not None else None
         start_time = time.perf_counter()
         matched, unmatched_dets, unmatched_trks = associate_dets_to_tracks(dets, trk_preds,
             self.match_type, self.asso, self.asso_thres, trk_innovation_matrix,
-            trk_gates=trk_gates)
+            trk_gates=trk_gates, trk_centres=self._trk_centres)
         end_time = time.perf_counter()
         duration = end_time - start_time
         logging.debug(f"Association took {duration:.6f} seconds")

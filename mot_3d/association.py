@@ -12,7 +12,7 @@ OUT_OF_GATE_COST = 1e6
 
 
 def associate_dets_to_tracks(dets, tracks, mode, asso,
-    dist_threshold=0.9, trk_innovation_matrix=None, trk_gates=None):
+    dist_threshold=0.9, trk_innovation_matrix=None, trk_gates=None, trk_centres=None):
     """ associate the tracks with detections
 
         trk_gates (optional): per-track positional gate in metres. When given (only
@@ -26,7 +26,7 @@ def associate_dets_to_tracks(dets, tracks, mode, asso,
     if mode == 'bipartite':
         matched_indices, dist_matrix, over_gate = \
             bipartite_matcher(dets, tracks, asso, dist_threshold,
-                              trk_innovation_matrix, trk_gates)
+                              trk_innovation_matrix, trk_gates, trk_centres)
     elif mode == 'greedy':
         matched_indices, dist_matrix = \
             greedy_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix)
@@ -56,7 +56,7 @@ def associate_dets_to_tracks(dets, tracks, mode, asso,
 
 
 def bipartite_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix,
-                      trk_gates=None):
+                      trk_gates=None, trk_centres=None):
     if asso == 'iou':
         dist_matrix = compute_iou_distance_custom(dets, tracks, asso)
     elif asso == 'giou':
@@ -72,10 +72,13 @@ def bipartite_matcher(dets, tracks, asso, dist_threshold, trk_innovation_matrix,
         # Gate on the xy residual, not on dist_matrix: the euler cost is a 7-D
         # norm that is ~2/3 box-size jitter, so a kinematic budget applied to it
         # fragments the tracker. The full cost still RANKS the in-gate candidates.
+        # trk_centres (optional) moves the gate's centre off the prediction,
+        # e.g. onto the last observed position for the physical gate.
+        centres = trk_centres if trk_centres is not None else [(trk.x, trk.y) for trk in tracks]
         xy = np.empty(dist_matrix.shape)
         for d, det in enumerate(dets):
-            for t, trk in enumerate(tracks):
-                xy[d, t] = np.hypot(det.x - trk.x, det.y - trk.y)
+            for t, (cx, cy) in enumerate(centres):
+                xy[d, t] = np.hypot(det.x - cx, det.y - cy)
         over_gate = xy > np.asarray(trk_gates)[np.newaxis, :]
         cost_matrix = np.where(over_gate, OUT_OF_GATE_COST, dist_matrix)
 

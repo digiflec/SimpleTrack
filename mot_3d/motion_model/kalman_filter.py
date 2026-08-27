@@ -43,7 +43,17 @@ class KalmanFilterMotionModel:
             Q[d, d] = self.CIIM_DIM_PSD * dt
         return Q
 
-    def __init__(self, bbox: BBox, inst_type, time_stamp, covariance='default'):
+    def __init__(self, bbox: BBox, inst_type, time_stamp, covariance='default',
+                 max_speed=0.0):
+        # CIIMDEV-779: max_speed (m/s, 0 = off) clamps the horizontal velocity
+        # state after every update. This is a prior on the STATE, not on the
+        # association: with the physical gate the filter cannot be handed a
+        # super-human displacement, but on re-acquire after a coast it still
+        # attributes the residual to velocity and overshoots (~10 mph seen on
+        # DCLG-4). Bounding the state bounds the coast that follows
+        # (max_age * max_speed) and the published speed. Measured effect on the
+        # association itself: none (A/B over three hours, identical rows).
+        self.max_speed = float(max_speed or 0.0)
         # the time stamp of last observation
         self.prev_time_stamp = time_stamp
         self.latest_time_stamp = time_stamp
@@ -178,6 +188,11 @@ class KalmanFilterMotionModel:
 
         self.kf.update(bbox)
         self.prev_time_stamp = self.latest_time_stamp
+        if self.max_speed > 0:
+            speed = float(np.hypot(self.kf.x[7, 0], self.kf.x[8, 0]))
+            if speed > self.max_speed:
+                self.kf.x[7, 0] *= self.max_speed / speed
+                self.kf.x[8, 0] *= self.max_speed / speed
 
         if self.kf.x[3] >= np.pi: self.kf.x[3] -= np.pi * 2    # make the theta still in the rage
         if self.kf.x[3] < -np.pi: self.kf.x[3] += np.pi * 2
